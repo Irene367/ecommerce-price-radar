@@ -2,9 +2,18 @@
 
 这是一个可上传到 SkillHub 的 Agent Skill 项目，面向一人电商卖家、小团队运营和独立店铺主。
 
-不是简单总结竞品变化，而是帮你判断要不要跟价、怎么防守、今天该改什么。
+一句话价值：不是简单总结竞品变化，而是帮你判断要不要跟价、怎么防守、今天该改什么。
 
-它不是普通的竞品总结助手，而是围绕“变化识别 → 风险判断 → 跟价建议 → 非价格防守 → 行动清单”形成稳定分析闭环。
+它围绕“变化识别 → 风险判断 → 跟价建议 → 非价格防守 → 行动清单”形成稳定分析闭环。
+
+## 最快使用方式
+
+1. 打开 `templates/minimal-daily-input.md`，复制最小输入模板。
+2. 填写本店商品、本店到手价、最低毛利要求，以及 1-3 个重点竞品的昨日/今日到手价、优惠、库存、发货承诺和评价变化。
+3. 直接提问：“今天要不要跟价？如果不跟价，该怎么防守？”
+4. 查看输出前部的“本次识别模式”和“决策卡片”，再执行今日行动清单。
+
+更短的上手说明见 `examples/quickstart-5min.md`，常见问题见 `examples/faq.md`。
 
 ## 适合谁用
 
@@ -12,20 +21,19 @@
 - 适合看到竞品降价后，不确定该不该跟价、该降多少、是否会伤害毛利的小团队运营。
 - 适合想把竞品变化整理成风险判断、非价格防守策略和今日行动清单的电商卖家。
 
-## v1.2 新增能力
+## v1.3.1 更新
 
-- 模式自动识别。
-- 决策卡片。
-- 价格战风险提醒。
-- 毛利底线计算模板。
-- 竞品分层判断规则。
+- `scripts/fetch_public_page.py` 增加 `--retries` 和 `--timeout`，对网络超时、连接失败、临时 HTTP 错误做有限重试。
+- 每个 URL 输出新增 `retry_count`、`timeout_seconds`、`failure_type`、`suggested_fallback`，便于判断失败原因和回退方式。
+- 脚本使用 Python 标准库实现，无需额外安装 `bs4`、`requests`、`trafilatura`、`selenium` 或其他第三方库。
+- 新增 `examples/quickstart-5min.md`、`examples/faq.md` 和 `templates/minimal-daily-input.md`，提升新用户上手速度。
+- `SKILL.md` 新增“3 分钟快速开始”“最小输入示例”“常见问题 FAQ”简版板块。
 
-## v1.3 新增能力
+## v1.3 能力
 
 - 支持合规公开网页读取模式。
-- 可读取用户主动提供的少量公开 URL。
-- 只提取页面可见文本，不登录、不绕过验证码、不突破反爬。
-- `scripts/fetch_public_page.py` 使用 Python 标准库实现，无需额外安装 `bs4`、`requests` 或其他第三方库。
+- 可读取用户主动提供的少量公开 URL，一次默认最多 10 个。
+- 只提取页面可见文本，不登录、不使用 Cookie、不绕过验证码、不突破反爬。
 - 页面无法读取时回退到粘贴内容、截图文字或表格分析。
 - 网页读取结果会标注来源、置信度和需复核字段。
 
@@ -39,21 +47,13 @@
 - 一人店铺调价决策辅助。
 - 用户主动提供少量公开 URL 时，提取页面可见文本并整理为竞品字段。
 
-## 竞品分层怎么填
-
-`templates/competitor-monitor-table.csv` 已包含“竞品分层”字段。建议填写以下类型：
-
-- 直接竞品：同品类、同价格带、同核心卖点，价格变化对本店影响最大。
-- 低价扰动竞品：价格明显低，但评价、发货、品牌、材质、服务或稳定性较弱，不建议盲目跟价。
-- 价格锚点竞品：用户常拿来对比价格或规格，用于判断价格感知。
-- 头部/品牌竞品：品牌和服务承诺强，适合学习卖点表达和详情页结构。
-- 替代品竞品：品类不同但解决同一需求，用于提炼本店差异化理由。
-
 ## 可信边界
 
-- 只基于用户提供的公开数据、表格、截图描述、链接整理结果或文本材料分析。
+- 只基于用户提供的公开数据、表格、截图描述、链接整理结果、公开 URL 页面可见文本或文本材料分析。
 - 不自动登录平台。
-- 不绕过验证码、登录墙、风控或反爬限制。
+- 不使用 Cookie，不读取本地浏览器数据。
+- 不执行页面 JavaScript，不使用 Selenium。
+- 不绕过验证码、登录墙、反爬、风控、付费墙或平台限制。
 - 不承诺能读取所有电商平台页面。
 - 不做高频、批量、定时监控；一次默认最多处理 10 个 URL。
 - 不自动修改店铺价格、库存、标题、优惠券或广告出价。
@@ -73,12 +73,30 @@ ecommerce-price-radar/
     web-read-input.md
     web-read-output.md
     review-insight-input.md
+    quickstart-5min.md
+    faq.md
   scripts/
     fetch_public_page.py
   templates/
     competitor-monitor-table.csv
     daily-change-report.md
+    minimal-daily-input.md
 ```
+
+上传 SkillHub 时，请上传完整项目 zip，而不是只上传 `SKILL.md`。脚本、示例和模板会帮助 SkillHub 评测更完整地理解能力边界和使用方式。
+
+## 公开网页读取脚本
+
+本项目的 `scripts/fetch_public_page.py` 使用 Python 标准库实现，无需额外安装 `bs4`、`requests` 或其他第三方库。
+
+示例：
+
+```bash
+python scripts/fetch_public_page.py --url https://example.com
+python scripts/fetch_public_page.py --urls-file urls.txt --timeout 10 --retries 2
+```
+
+脚本输出稳定 JSON，包含读取状态、页面可见文本片段、候选价格/优惠/库存/发货/评价字段、警告、失败类型和建议回退方式。
 
 ## 推荐输入
 
@@ -110,21 +128,15 @@ ecommerce-price-radar/
 3.
 ```
 
-## 推荐使用方式
+## 竞品分层怎么填
 
-1. 用 `templates/competitor-monitor-table.csv` 建立日常竞品监控表。
-2. 每天把人工整理的数据、截图描述或表格内容交给 Agent。
-3. 用 `templates/daily-change-report.md` 输出日报。
-4. 每周汇总日报，让 Agent 做价格带、竞品策略和防守动作复盘。
+`templates/competitor-monitor-table.csv` 已包含“竞品分层”字段。建议填写：
 
-## 示例文件
-
-- `examples/setup-input.md`：搭建竞品监控表的示例请求。
-- `examples/daily-analysis-input.md`：完整每日价格变化分析输入。
-- `examples/daily-analysis-output.md`：完整分析报告输出。
-- `examples/web-read-input.md`：公开网页读取模式输入。
-- `examples/web-read-output.md`：公开网页读取模式输出。
-- `examples/review-insight-input.md`：评价与卖点洞察输入。
+- 直接竞品：同品类、同价格带、同核心卖点，价格变化对本店影响最大。
+- 低价扰动竞品：价格明显低，但评价、发货、品牌、材质、服务或稳定性较弱，不建议盲目跟价。
+- 价格锚点竞品：用户常拿来对比价格或规格，用于判断价格感知。
+- 头部/品牌竞品：品牌和服务承诺强，适合学习卖点表达和详情页结构。
+- 替代品竞品：品类不同但解决同一需求，用于提炼本店差异化理由。
 
 ## 已知限制
 

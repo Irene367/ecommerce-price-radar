@@ -19,6 +19,7 @@ import json
 import re
 import socket
 import sys
+import time
 from datetime import datetime, timezone
 from html import unescape
 from html.parser import HTMLParser
@@ -29,7 +30,8 @@ from urllib.request import Request, urlopen
 
 
 MAX_URLS = 10
-TIMEOUT_SECONDS = 10
+DEFAULT_TIMEOUT_SECONDS = 10
+DEFAULT_RETRIES = 2
 USER_AGENT = "EcommercePriceRadarSkill/1.3 (+public-page-analysis; no-login; no-bypass)"
 MAX_TEXT_CHARS = 5000
 MAX_DOWNLOAD_BYTES = 2_000_000
@@ -43,21 +45,22 @@ CAPTCHA_PATTERNS = re.compile(
     re.IGNORECASE,
 )
 JS_RENDER_PATTERNS = re.compile(
-    r"(enable javascript|请启用javascript|app-root|__next|nuxt|window\.__|需要.*javascript)",
+    r"(enable javascript|请启用javascript|app-root|__next|nuxt|window\.__|需要javascript)",
     re.IGNORECASE,
 )
 
-PRICE_PATTERN = re.compile(
-    r"(?:¥|￥|RMB|CNY)?\s*(?:[1-9]\d{0,5})(?:\.\d{1,2})?\s*(?:元|块)?"
-)
+PRICE_PATTERN = re.compile(r"(?:¥|￥|RMB|CNY)?\s*(?:[1-9]\d{0,5})(?:\.\d{1,2})?\s*(?:元|块)?")
 DISCOUNT_PATTERN = re.compile(r".{0,12}(?:券|优惠|满减|立减|折扣|补贴|秒杀|活动|促销).{0,30}")
 SHIPPING_PATTERN = re.compile(r".{0,12}(?:发货|现货|包邮|运费|次日达|小时内|顺丰|物流).{0,30}")
 STOCK_PATTERN = re.compile(r".{0,12}(?:库存|有货|缺货|售罄|补货|仅剩|现货).{0,30}")
-REVIEW_PATTERN = re.compile(r".{0,12}(?:评价|评分|评论|好评|差评|星|review|rating).{0,30}", re.IGNORECASE)
+REVIEW_PATTERN = re.compile(r".{0,12}(?:评价|评分|评论|好评|差评|星级|review|rating).{0,30}", re.IGNORECASE)
+
+TRANSIENT_HTTP_STATUS = {408, 425, 429, 500, 502, 503, 504}
+FALLBACK_MESSAGE = "请粘贴页面内容、截图文字或整理表格后继续分析。"
 
 
 class VisibleTextParser(HTMLParser):
-    """Small HTML parser that extracts title, description meta, and visible text."""
+    """Small HTML parser that extracts title, meta description, and visible text."""
 
     SKIP_TAGS = {"script", "style", "noscript", "template", "svg"}
 
@@ -118,6 +121,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--url", action="append", help="A single public URL. Can be repeated.")
     parser.add_argument("--urls-file", help="Text file containing one URL per line.")
     parser.add_argument("--output", help="Output JSON file path. Defaults to stdout.")
+    parser.add_argument(
+        "--retries",
+        type=int,
+        default=DEFAULT_RETRIES,
+        help="Retry count for timeout, connection failure, and temporary HTTP errors. Default: 2.",
+    )
+    parser.add_argument(
+        "--timeout",
+        type=float,
+        default=DEFAULT_TIMEOUT_SECONDS,
+        help="Request timeout in seconds. Default: 10.",
+    )
     return parser.parse_args()
 
 
@@ -234,7 +249,26 @@ def parse_html(html: str) -> tuple[str, str, str]:
     return parser.parsed()
 
 
-def empty_result(input_url: str, warning: str = "", error: str = "") -> dict[str, Any]:
+def empty_candidates() -> dict[str, list[str]]:
+    return {
+        "prices": [],
+        "discount_keywords": [],
+        "shipping_keywords": [],
+        "stock_keywords": [],
+        "review_keywords": [],
+    }
+
+
+def empty_result(
+    input_url: str,
+    warning: str = "",
+    error: str = "",
+    *,
+    retry_count: int = 0,
+    timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
+    failure_type: str = "",
+    suggested_fallback: str = FALLBACK_MESSAGE,
+) -> dict[str, Any]:
     warnings = [warning] if warning else []
     return {
         "input_url": input_url,
@@ -243,15 +277,13 @@ def empty_result(input_url: str, warning: str = "", error: str = "") -> dict[str
         "title": "",
         "meta_description": "",
         "visible_text_snippet": "",
-        "extracted_candidates": {
-            "prices": [],
-            "discount_keywords": [],
-            "shipping_keywords": [],
-            "stock_keywords": [],
-            "review_keywords": [],
-        },
+        "extracted_candidates": empty_candidates(),
         "warnings": warnings,
         "error": error,
+        "retry_count": retry_count,
+        "timeout_seconds": timeout_seconds,
+        "failure_type": failure_type,
+        "suggested_fallback": suggested_fallback if error or warning else "",
     }
 
 
@@ -263,8 +295,12 @@ def build_result(
     meta_description: str,
     visible_text: str,
     html: str,
+    *,
+    retry_count: int,
+    timeout_seconds: float,
     extra_warnings: list[str] | None = None,
     error: str = "",
+    failure_type: str = "",
 ) -> dict[str, Any]:
     warnings = detect_warnings(status_code, visible_text, html)
     if extra_warnings:
@@ -273,6 +309,8 @@ def build_result(
         warnings.append("HTTP 状态码异常；不把该页面内容作为可靠事实。")
         if not error:
             error = f"HTTP {status_code}"
+        if not failure_type:
+            failure_type = "http_error"
     return {
         "input_url": input_url,
         "final_url": final_url,
@@ -283,14 +321,27 @@ def build_result(
         "extracted_candidates": extract_candidates(visible_text),
         "warnings": warnings,
         "error": error,
+        "retry_count": retry_count,
+        "timeout_seconds": timeout_seconds,
+        "failure_type": failure_type,
+        "suggested_fallback": FALLBACK_MESSAGE if error or warnings else "",
     }
 
 
-def fetch_one(url: str) -> dict[str, Any]:
-    validation_error = validate_url(url)
-    if validation_error:
-        return empty_result(url, validation_error, validation_error)
+def classify_url_error(exc: BaseException) -> str:
+    reason = getattr(exc, "reason", exc)
+    if isinstance(reason, socket.timeout) or isinstance(exc, (TimeoutError, socket.timeout)):
+        return "timeout"
+    if isinstance(exc, URLError):
+        return "connection_error"
+    return "read_error"
 
+
+def should_retry_http(status_code: int, attempt: int, retries: int) -> bool:
+    return status_code in TRANSIENT_HTTP_STATUS and attempt < retries
+
+
+def fetch_once(url: str, timeout_seconds: float) -> dict[str, Any]:
     request = Request(
         url,
         headers={
@@ -299,83 +350,156 @@ def fetch_one(url: str) -> dict[str, Any]:
         },
         method="GET",
     )
+    with urlopen(request, timeout=timeout_seconds) as response:
+        status_code = getattr(response, "status", None) or response.getcode()
+        final_url = response.geturl()
+        content_type = response.headers.get("content-type", "")
+        body = response.read(MAX_DOWNLOAD_BYTES + 1)
+        extra_warnings: list[str] = []
+        if len(body) > MAX_DOWNLOAD_BYTES:
+            body = body[:MAX_DOWNLOAD_BYTES]
+            extra_warnings.append("页面内容较大，已截断读取前 2MB。")
+        html = decode_body(body, content_type)
+        title, meta_description, visible_text = parse_html(html)
+        return {
+            "input_url": url,
+            "final_url": final_url,
+            "status_code": status_code,
+            "title": title,
+            "meta_description": meta_description,
+            "visible_text": visible_text,
+            "html": html,
+            "extra_warnings": extra_warnings,
+        }
 
-    try:
-        with urlopen(request, timeout=TIMEOUT_SECONDS) as response:
-            status_code = getattr(response, "status", None) or response.getcode()
-            final_url = response.geturl()
-            content_type = response.headers.get("content-type", "")
-            body = response.read(MAX_DOWNLOAD_BYTES + 1)
-            extra_warnings: list[str] = []
-            if len(body) > MAX_DOWNLOAD_BYTES:
-                body = body[:MAX_DOWNLOAD_BYTES]
-                extra_warnings.append("页面内容较大，已截断读取前 2MB。")
-            html = decode_body(body, content_type)
-            title, meta_description, visible_text = parse_html(html)
+
+def fetch_one(url: str, retries: int, timeout_seconds: float) -> dict[str, Any]:
+    validation_error = validate_url(url)
+    if validation_error:
+        return empty_result(
+            url,
+            validation_error,
+            validation_error,
+            timeout_seconds=timeout_seconds,
+            failure_type="invalid_url",
+        )
+
+    attempts_used = 0
+    last_error = ""
+    last_failure_type = ""
+    retries = max(0, retries)
+
+    for attempt in range(retries + 1):
+        attempts_used = attempt
+        try:
+            raw = fetch_once(url, timeout_seconds)
+            status_code = raw["status_code"]
+            if should_retry_http(status_code, attempt, retries):
+                last_error = f"HTTP {status_code}"
+                last_failure_type = "temporary_http_error"
+                time.sleep(min(0.5 * (attempt + 1), 2.0))
+                continue
             return build_result(
                 input_url=url,
-                final_url=final_url,
+                final_url=raw["final_url"],
                 status_code=status_code,
+                title=raw["title"],
+                meta_description=raw["meta_description"],
+                visible_text=raw["visible_text"],
+                html=raw["html"],
+                extra_warnings=raw["extra_warnings"],
+                retry_count=attempt,
+                timeout_seconds=timeout_seconds,
+                error=last_error if status_code in TRANSIENT_HTTP_STATUS and attempt else "",
+                failure_type=last_failure_type if status_code in TRANSIENT_HTTP_STATUS and attempt else "",
+            )
+        except HTTPError as exc:
+            if should_retry_http(exc.code, attempt, retries):
+                last_error = f"HTTP {exc.code}"
+                last_failure_type = "temporary_http_error"
+                time.sleep(min(0.5 * (attempt + 1), 2.0))
+                continue
+            body = b""
+            try:
+                body = exc.read(MAX_DOWNLOAD_BYTES)
+            except Exception:
+                body = b""
+            content_type = exc.headers.get("content-type", "") if exc.headers else ""
+            html = decode_body(body, content_type) if body else ""
+            title, meta_description, visible_text = parse_html(html) if html else ("", "", "")
+            return build_result(
+                input_url=url,
+                final_url=exc.geturl() or url,
+                status_code=exc.code,
                 title=title,
                 meta_description=meta_description,
                 visible_text=visible_text,
                 html=html,
-                extra_warnings=extra_warnings,
+                error=f"HTTP {exc.code}",
+                retry_count=attempt,
+                timeout_seconds=timeout_seconds,
+                failure_type="http_error",
             )
-    except HTTPError as exc:
-        body = b""
-        try:
-            body = exc.read(MAX_DOWNLOAD_BYTES)
-        except Exception:
-            body = b""
-        content_type = exc.headers.get("content-type", "") if exc.headers else ""
-        html = decode_body(body, content_type) if body else ""
-        title, meta_description, visible_text = parse_html(html) if html else ("", "", "")
-        return build_result(
-            input_url=url,
-            final_url=exc.geturl() or url,
-            status_code=exc.code,
-            title=title,
-            meta_description=meta_description,
-            visible_text=visible_text,
-            html=html,
-            error=f"HTTP {exc.code}",
-        )
-    except (URLError, TimeoutError, socket.timeout) as exc:
-        return empty_result(
-            url,
-            "读取失败，请用户粘贴页面内容、截图文字或整理表格。",
-            str(exc),
-        )
-    except Exception as exc:  # pragma: no cover - defensive stability
-        return empty_result(
-            url,
-            "页面读取或解析失败，请用户粘贴页面内容、截图文字或整理表格。",
-            str(exc),
-        )
+        except (URLError, TimeoutError, socket.timeout) as exc:
+            last_error = str(exc)
+            last_failure_type = classify_url_error(exc)
+            if attempt < retries:
+                time.sleep(min(0.5 * (attempt + 1), 2.0))
+                continue
+            return empty_result(
+                url,
+                "读取失败，请用户粘贴页面内容、截图文字或整理表格。",
+                last_error,
+                retry_count=attempt,
+                timeout_seconds=timeout_seconds,
+                failure_type=last_failure_type,
+            )
+        except Exception as exc:  # pragma: no cover - defensive stability
+            return empty_result(
+                url,
+                "页面读取或解析失败，请用户粘贴页面内容、截图文字或整理表格。",
+                str(exc),
+                retry_count=attempts_used,
+                timeout_seconds=timeout_seconds,
+                failure_type="parse_error",
+            )
+
+    return empty_result(
+        url,
+        "读取失败，请用户粘贴页面内容、截图文字或整理表格。",
+        last_error,
+        retry_count=attempts_used,
+        timeout_seconds=timeout_seconds,
+        failure_type=last_failure_type or "read_error",
+    )
 
 
 def main() -> int:
     args = parse_args()
-    try:
-        urls = load_urls(args)
-    except ValueError as exc:
-        payload = stable_error(str(exc))
+    if args.timeout <= 0:
+        payload = stable_error("--timeout 必须大于 0")
+    elif args.retries < 0:
+        payload = stable_error("--retries 必须大于等于 0")
     else:
-        warnings: list[str] = []
-        if not urls:
-            payload = stable_error("请通过 --url 或 --urls-file 提供至少 1 个 URL。")
+        try:
+            urls = load_urls(args)
+        except ValueError as exc:
+            payload = stable_error(str(exc))
         else:
-            if len(urls) > MAX_URLS:
-                warnings.append("本次仅处理前 10 个 URL，剩余 URL 请分批处理。")
-            selected = urls[:MAX_URLS]
-            payload = {
-                "generated_at": now_iso(),
-                "max_urls": MAX_URLS,
-                "processed_count": len(selected),
-                "warnings": warnings,
-                "results": [fetch_one(url) for url in selected],
-            }
+            warnings: list[str] = []
+            if not urls:
+                payload = stable_error("请通过 --url 或 --urls-file 提供至少 1 个 URL。")
+            else:
+                if len(urls) > MAX_URLS:
+                    warnings.append("本次仅处理前 10 个 URL，剩余 URL 请分批处理。")
+                selected = urls[:MAX_URLS]
+                payload = {
+                    "generated_at": now_iso(),
+                    "max_urls": MAX_URLS,
+                    "processed_count": len(selected),
+                    "warnings": warnings,
+                    "results": [fetch_one(url, args.retries, args.timeout) for url in selected],
+                }
 
     text = json.dumps(payload, ensure_ascii=False, indent=2)
     if args.output:
